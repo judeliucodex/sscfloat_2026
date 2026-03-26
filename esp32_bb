@@ -1,0 +1,271 @@
+#include <Wire.h>
+#include <MS5837.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <ArduinoOTA.h>
+#include <Update.h>
+
+// I2C Pins
+#define CUSTOM_SDA_PIN 21
+#define CUSTOM_SCL_PIN 22
+
+MS5837 sensor;
+
+// WiFi credentials
+const char* ssid     = "SSCFloat";
+const char* password = "DT1234dt";
+WebServer server(80);
+
+// Sensor variables
+float pressures[120];
+int sensorIdx = 0;
+int iterationCount = 0;
+float currentRelativeDepth = 0.0; // Current depth in meters relative to surface
+float surfaceDepthOffset = 0.0;   // Captured at startup to zero out atmospheric pressure
+
+// Stepper motor pins
+const int dirPin  = 4;
+const int stepPin = 16;
+int motorSpeed = 600;
+
+// Limit Switches
+#define BUTTON_PIN_1 19    // Bottom Limit (Sinking stop)
+#define BUTTON_PIN_2 18    // Top Limit (Floating stop)
+
+// State Machine Definition
+enum SystemMode {
+  MODE_IDLE,
+  MODE_SEQUENCE,
+  MODE_HOLD_DEPTH
+};
+volatile SystemMode currentMode = MODE_IDLE; // Global state variable
+
+// Mutexes
+SemaphoreHandle_t dataLock = NULL;
+SemaphoreHandle_t modeLock = NULL;
+
+TaskHandle_t sensorTaskHandle = NULL;
+TaskHandle_t webTaskHandle = NULL;
+TaskHandle_t motorTaskHandle = NULL;
+
+// --- SENSOR TASK ---
+void sensorTask(void *parameter) {
+  while(1) {
+    sensor.read();
+    
+    if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+      pressures[sensorIdx] = sensor.pressure();
+      // Calculate depth relative to surface zero-point
+      currentRelativeDepth = sensor.depth() - surfaceDepthOffset; 
+      
+      sensorIdx = (sensorIdx + 1) % 120;
+      iterationCount++;
+      xSemaphoreGive(dataLock);
+    }
+    // Increased read rate to 10Hz for tighter control loop response
+    vTaskDelay(pdMS_TO_TICKS(100)); 
+  }
+}
+
+// --- WEB SERVER TASK ---
+void webTask(void *parameter) {
+  while(1) {
+    server.handleClient();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// --- WEB ENDPOINTS ---
+void handleData() {
+  if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+    int count = iterationCount < 120 ? iterationCount : 120;
+    String data = "Current Depth: " + String(currentRelativeDepth * 100.0) + " cm\n\n";
+    
+    for (int i = 0; i < count; i++) {
+      int idx = (sensorIdx + i) % 120;
+      data += String(pressures[idx]) + "\n";
+    }
+    xSemaphoreGive(dataLock);
+    server.send(200, "text/plain", data);
+  }
+}
+
+void handleControl() {
+  if(server.hasArg("action")) {
+    String action = server.arg("action");
+    
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      if (action == "start") currentMode = MODE_SEQUENCE;
+      else if (action == "hold") currentMode = MODE_HOLD_DEPTH;
+      else if (action == "stop") currentMode = MODE_IDLE;
+      xSemaphoreGive(modeLock);
+    }
+    
+    // Redirect back to main control page immediately
+    server.sendHeader("Location", "/control");
+    server.send(303);
+    return;
+  } 
+
+  // Generate HTML Page
+  SystemMode modeCopy;
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    modeCopy = currentMode;
+    xSemaphoreGive(modeLock);
+  }
+  
+  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>button { padding: 15px; margin: 10px; font-size: 18px; width: 90%; max-width: 400px; display: block; } ";
+  html += ".stop { background-color: #ff4c4c; color: white; font-weight: bold; } </style></head><body>";
+  html += "<h2>MATE ROV Float Controller</h2>";
+  
+  if (modeCopy == MODE_IDLE) html += "<p>Status: <strong>IDLE</strong></p>";
+  else if (modeCopy == MODE_SEQUENCE) html += "<p>Status: <strong>RUNNING SEQUENCE</strong></p>";
+  else if (modeCopy == MODE_HOLD_DEPTH) html += "<p>Status: <strong>HOLDING 40CM DEPTH</strong></p>";
+
+  html += "<button onclick=\"location.href='/control?action=start'\">Run Sequence (To Bottom)</button>";
+  html += "<button onclick=\"location.href='/control?action=hold'\">Hold Depth (40cm)</button>";
+  html += "<button class='stop' onclick=\"location.href='/control?action=stop'\">EMERGENCY STOP</button>";
+  
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+// --- HELPER: STEP MOTOR CHUNK ---
+// Steps the motor in small chunks so it can be instantly aborted if mode changes
+void stepMotorChunk(int steps, SystemMode expectedMode) {
+  for (int i = 0; i < steps; i++) {
+    if (currentMode != expectedMode) return; // Abort instantly
+    
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(motorSpeed);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(motorSpeed);
+    
+    if (i % 20 == 0) taskYIELD(); // Feed watchdog
+  }
+}
+
+// --- MOTOR SEQUENCE (ABORTABLE) ---
+void runStepperSequence() {
+  // SINK: Spin anticlockwise until Bottom Limit (BTN 1)
+  digitalWrite(dirPin, HIGH);
+  while(digitalRead(BUTTON_PIN_1) == HIGH && currentMode == MODE_SEQUENCE) {  
+      stepMotorChunk(20, MODE_SEQUENCE);
+  }
+  
+  if (currentMode != MODE_SEQUENCE) return; // Abort check
+  
+  // WAIT 45 SECONDS (Implemented in small chunks to allow Emergency Stop)
+  for(int i = 0; i < 450; i++) {
+    if (currentMode != MODE_SEQUENCE) return; // Abort check
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+  
+  if (currentMode != MODE_SEQUENCE) return; // Abort check
+  
+  // FLOAT: Spin clockwise until Top Limit (BTN 2)
+  digitalWrite(dirPin, LOW);
+  while(digitalRead(BUTTON_PIN_2) == HIGH && currentMode == MODE_SEQUENCE) {  
+      stepMotorChunk(20, MODE_SEQUENCE);
+  }
+  
+  // Sequence finished, return to idle
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    if (currentMode == MODE_SEQUENCE) currentMode = MODE_IDLE;
+    xSemaphoreGive(modeLock);
+  }
+}
+
+// --- BANG-BANG CONTROLLER ---
+void runBangBangController() {
+  float depthCopy = 0.0;
+  if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+    depthCopy = currentRelativeDepth;
+    xSemaphoreGive(dataLock);
+  }
+
+  // Target = 0.40m. Deadband = 38cm to 42cm.
+  if (depthCopy > 0.42 && digitalRead(BUTTON_PIN_2) == HIGH) {
+    // Too deep -> Go UP (Clockwise -> dirPin LOW)
+    digitalWrite(dirPin, LOW);
+    stepMotorChunk(50, MODE_HOLD_DEPTH);
+  } 
+  else if (depthCopy < 0.38 && digitalRead(BUTTON_PIN_1) == HIGH) {
+    // Too shallow -> Go DOWN (Anticlockwise -> dirPin HIGH)
+    digitalWrite(dirPin, HIGH);
+    stepMotorChunk(50, MODE_HOLD_DEPTH);
+  } 
+  else {
+    // Within deadband or hit a limit switch -> Do nothing, wait a bit
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// --- MOTOR TASK ---
+void motorTask(void *parameter) {
+  while(1) {
+    SystemMode currentModeCopy;
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      currentModeCopy = currentMode;
+      xSemaphoreGive(modeLock);
+    }
+    
+    if (currentModeCopy == MODE_SEQUENCE) {
+      runStepperSequence();
+    } 
+    else if (currentModeCopy == MODE_HOLD_DEPTH) {
+      runBangBangController();
+    } 
+    else {
+      // MODE_IDLE
+      vTaskDelay(pdMS_TO_TICKS(100)); 
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200); 
+  delay(1000);
+  
+  Wire.begin(CUSTOM_SDA_PIN, CUSTOM_SCL_PIN);
+  
+  if (!sensor.init()) {
+    Serial.println("Sensor failed to initialize.");
+    while (1);
+  }
+  sensor.setFluidDensity(997); // Freshwater
+  
+  // Tare the depth sensor on startup
+  sensor.read();
+  surfaceDepthOffset = sensor.depth(); 
+  
+  pinMode(dirPin, OUTPUT);
+  pinMode(stepPin, OUTPUT);
+  pinMode(BUTTON_PIN_1, INPUT_PULLUP);
+  pinMode(BUTTON_PIN_2, INPUT_PULLUP); 
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+  
+  ArduinoOTA.begin();
+  
+  server.on("/data", handleData);
+  server.on("/control", handleControl);
+  server.begin();
+  
+  dataLock = xSemaphoreCreateMutex();
+  modeLock = xSemaphoreCreateMutex();
+  
+  xTaskCreatePinnedToCore(sensorTask, "SensorTask", 4096, NULL, 2, &sensorTaskHandle, 0);
+  xTaskCreatePinnedToCore(webTask, "WebTask", 4096, NULL, 1, &webTaskHandle, 0);
+  xTaskCreatePinnedToCore(motorTask, "MotorTask", 4096, NULL, 3, &motorTaskHandle, 1);
+}
+
+void loop() {
+  ArduinoOTA.handle(); 
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
