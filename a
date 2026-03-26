@@ -1,0 +1,274 @@
+#include <Wire.h>
+#include <MS5837.h>
+#include <WiFi.h>              // Replaced ESP8266WiFi.h for ESP32
+#include <WebServer.h>         // Replaced ESP8266WebServer.h for ESP32
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include <ArduinoOTA.h>
+#include <Update.h>
+
+// Define sensor I2C pins for ESP32
+#define CUSTOM_SDA_PIN 21 
+#define CUSTOM_SCL_PIN 22 
+
+MS5837 sensor;
+
+// WiFi credentials
+const char* ssid     = "SSCFloat";
+const char* password = "DT1234dt";
+
+WebServer server(80);  
+
+// Sensor iteration variables
+float pressures[120];
+volatile float currentDepth = 0.0; // Global variable to store depth for PID
+int sensorIdx = 0;
+int iterationCount = 0;    
+
+// Stepper motor pins and settings
+const int dirPin  = 4;
+const int stepPin = 16;  
+int motorSpeed = 600;
+
+#define BUTTON_PIN_1 19    //LOW
+#define BUTTON_PIN_2 18    //HIGH
+
+// --- PID Configuration Variables ---
+double kp = 50.0;  // Proportional tune
+double ki = 0.0;   // Integral tune
+double kd = 0.0;   // Derivative tune
+double setpoint = 0.40; // 40cm target depth (in meters)
+
+double integral = 0.0;
+double prevError = 0.0;
+unsigned long lastTime = 0;
+
+// Motor modes
+enum MotorMode { IDLE, SEQUENCE, PID_HOLD };
+MotorMode currentMode = IDLE;
+
+// Mutex and Queues
+SemaphoreHandle_t dataLock = NULL;
+TaskHandle_t sensorTaskHandle = NULL;
+TaskHandle_t webTaskHandle = NULL;
+TaskHandle_t motorTaskHandle = NULL;
+
+QueueHandle_t motorCommandQueue = NULL; // Now handles ints for modes
+volatile bool motorBusy = false;
+SemaphoreHandle_t motorStatusLock = NULL;
+
+// Sensor reading task (SPED UP FOR PID)
+void sensorTask(void *parameter) {
+  while(1) {
+    sensor.read();
+    
+    // Save current depth (in meters) for the PID loop
+    currentDepth = sensor.depth(); 
+
+    if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+      pressures[sensorIdx] = sensor.pressure();
+      sensorIdx = (sensorIdx + 1) % 120;
+      iterationCount++;
+      xSemaphoreGive(dataLock);
+    }
+    // Faster read rate: 10Hz is better for PID control
+    vTaskDelay(pdMS_TO_TICKS(100)); 
+  }
+}
+
+// Web server task
+void webTask(void *parameter) {
+  while(1) {
+    server.handleClient();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// Endpoint handler for /data
+void handleData() {
+  if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+    int count = iterationCount < 120 ? iterationCount : 120;
+    String data = "";
+    for (int i = 0; i < count; i++) {
+      int idx = (sensorIdx + i) % 120;
+      data += String(pressures[idx]) + "\n";
+    }
+    xSemaphoreGive(dataLock);
+    server.send(200, "text/plain", data);
+  }
+}
+
+// Modified runStepperSequence
+void runStepperSequence() {
+    digitalWrite(dirPin, HIGH);
+    while(digitalRead(BUTTON_PIN_1) == HIGH && currentMode == SEQUENCE) {  
+        digitalWrite(stepPin, HIGH);
+        delayMicroseconds(motorSpeed);
+        digitalWrite(stepPin, LOW);
+        delayMicroseconds(motorSpeed);
+        taskYIELD(); 
+    }
+    
+    if(currentMode != SEQUENCE) return; // Exit if aborted
+    delay(2000); // 2-second delay
+    
+    digitalWrite(dirPin, LOW);
+    while(digitalRead(BUTTON_PIN_2) == HIGH && currentMode == SEQUENCE) {  
+        digitalWrite(stepPin, HIGH);
+        delayMicroseconds(motorSpeed);
+        digitalWrite(stepPin, LOW);
+        delayMicroseconds(motorSpeed);
+        taskYIELD();
+    }
+}
+
+// Modified motorTask handling Sequence vs PID
+void motorTask(void *parameter) {
+  int command;
+  while(1) {
+    // If IDLE, block until a command arrives. If active, check queue without blocking (0 wait).
+    TickType_t waitTime = (currentMode == IDLE) ? portMAX_DELAY : 0;
+    
+    if(xQueueReceive(motorCommandQueue, &command, waitTime)) {
+      if(command == 1) currentMode = SEQUENCE;
+      else if(command == 2) {
+        currentMode = PID_HOLD;
+        integral = 0; // Reset PID memory on start
+        prevError = 0;
+        lastTime = millis();
+      }
+      else if(command == 0) currentMode = IDLE;
+      
+      if (xSemaphoreTake(motorStatusLock, portMAX_DELAY)) {
+        motorBusy = (currentMode != IDLE);
+        xSemaphoreGive(motorStatusLock);
+      }
+    }
+    
+    if (currentMode == SEQUENCE) {
+      runStepperSequence();
+      currentMode = IDLE; // Auto-stop when done
+      if (xSemaphoreTake(motorStatusLock, portMAX_DELAY)) { motorBusy = false; xSemaphoreGive(motorStatusLock); }
+    } 
+    else if (currentMode == PID_HOLD) {
+      // --- PID MATH CALCULATION ---
+      unsigned long now = millis();
+      double dt = (now - lastTime) / 1000.0; // Time in seconds
+      if(dt <= 0.0) dt = 0.01; // Prevent divide by zero
+      
+      double error = setpoint - currentDepth;
+      integral += (error * dt);
+      double derivative = (error - prevError) / dt;
+      
+      // Output dictates how many steps the motor should move this cycle
+      double output = (kp * error) + (ki * integral) + (kd * derivative);
+      
+      prevError = error;
+      lastTime = now;
+      
+      int stepsToMove = abs(output);
+      
+      // DETERMINE DIRECTION: Assuming positive error means we are too shallow (need to dive)
+      // YOU MUST VERIFY: Change this if your motor spins the wrong way to dive!
+      bool diveCommand = (output > 0); 
+      digitalWrite(dirPin, diveCommand ? LOW : HIGH); // Adjust LOW/HIGH based on your mechanics
+      
+      // Execute steps while respecting hardware limit switches
+      for(int i = 0; i < stepsToMove; i++) {
+         // SAFETY: Do not crush the limits! Modify the pins here based on which button protects which end.
+         if (diveCommand && digitalRead(BUTTON_PIN_1) == LOW) break; 
+         if (!diveCommand && digitalRead(BUTTON_PIN_2) == LOW) break; 
+         
+         digitalWrite(stepPin, HIGH);
+         delayMicroseconds(motorSpeed);
+         digitalWrite(stepPin, LOW);
+         delayMicroseconds(motorSpeed);
+      }
+      
+      vTaskDelay(pdMS_TO_TICKS(50)); // Allow other tasks to run
+    }
+  }
+}
+
+// Updated handleControl for the web server
+void handleControl() {
+  if(server.hasArg("action")) {
+    String action = server.arg("action");
+    int command = 0;
+    
+    if (action == "start_seq") command = 1;
+    else if (action == "start_pid") command = 2;
+    else if (action == "stop") command = 0;
+    
+    xQueueSend(motorCommandQueue, &command, portMAX_DELAY);
+    
+    // Redirect cleanly back to the control page
+    server.sendHeader("Location", "/control");
+    server.send(303);
+    return;
+  } 
+
+  // Build HTML UI
+  bool isBusy = false;
+  if (xSemaphoreTake(motorStatusLock, portMAX_DELAY)) {
+    isBusy = motorBusy;
+    xSemaphoreGive(motorStatusLock);
+  }
+  
+  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body>";
+  html += "<h2>Float Control Panel</h2>";
+  html += "<p>Current Depth: " + String(currentDepth) + " meters</p>";
+  
+  if (currentMode == SEQUENCE) html += "<p><strong>Status: Running Sequence...</strong></p>";
+  else if (currentMode == PID_HOLD) html += "<p><strong>Status: PID Holding at 40cm...</strong></p>";
+  else html += "<p><strong>Status: Idle</strong></p>";
+
+  html += "<br>";
+  html += "<button style='padding:15px; margin:5px;' onclick=\"location.href='/control?action=start_seq'\">Start Sequence</button>";
+  html += "<button style='padding:15px; margin:5px;' onclick=\"location.href='/control?action=start_pid'\">Hold Depth (40cm)</button>";
+  html += "<button style='padding:15px; margin:5px; background-color:red; color:white;' onclick=\"location.href='/control?action=stop'\">STOP ALL</button>";
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void setup() {
+    Serial.begin(115200);  
+    delay(1000);
+    
+    Wire.begin(CUSTOM_SDA_PIN, CUSTOM_SCL_PIN);
+    
+    if (!sensor.init()) {
+        while (1);
+    }
+    sensor.setFluidDensity(997); // Freshwater. Change to 1029 for seawater.
+    
+    pinMode(dirPin, OUTPUT);
+    pinMode(stepPin, OUTPUT);
+    pinMode(BUTTON_PIN_1, INPUT_PULLUP);
+    pinMode(BUTTON_PIN_2, INPUT_PULLUP); 
+    
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(ssid, password);
+    
+    ArduinoOTA.begin();
+    
+    server.on("/data", handleData);
+    server.on("/control", handleControl);
+    server.begin();
+    
+    dataLock = xSemaphoreCreateMutex();
+    motorCommandQueue = xQueueCreate(1, sizeof(int)); // Changed to handle integers
+    motorStatusLock = xSemaphoreCreateMutex();
+    
+    xTaskCreatePinnedToCore(sensorTask, "SensorTask", 4096, NULL, 2, &sensorTaskHandle, 0);
+    xTaskCreatePinnedToCore(webTask, "WebTask", 4096, NULL, 1, &webTaskHandle, 0);
+    xTaskCreatePinnedToCore(motorTask, "MotorTask", 4096, NULL, 3, &motorTaskHandle, 1);
+}
+
+void loop() {
+  ArduinoOTA.handle(); 
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
