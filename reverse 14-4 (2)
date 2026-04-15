@@ -29,7 +29,7 @@ float surfaceDepthOffset = 0.0;
 // --- MOTOR PINS & SETTINGS ---
 const int dirPin  = 4;
 const int stepPin = 16;
-int motorSpeed = 600;
+int motorSpeed = 2000;
 
 // --- LIMIT SWITCHES ---
 #define BUTTON_PIN_1 19    // Upper Limit (Sinking stop)
