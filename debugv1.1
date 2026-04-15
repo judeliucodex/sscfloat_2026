@@ -24,6 +24,7 @@ float depthHistory[120];
 int sensorIdx = 0;
 int iterationCount = 0;
 float currentRelativeDepth = 0.0; 
+float currentPressureMbar = 0.0; // Brought back pressure tracking
 float surfaceDepthOffset = 0.0;   
 
 // --- MOTOR PINS & SETTINGS ---
@@ -64,6 +65,7 @@ void sensorTask(void *parameter) {
     
     if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
       currentRelativeDepth = sensor.depth() - surfaceDepthOffset; 
+      currentPressureMbar = sensor.pressure();
       depthHistory[sensorIdx] = currentRelativeDepth * 100.0; 
       sensorIdx = (sensorIdx + 1) % 120;
       iterationCount++;
@@ -90,18 +92,22 @@ void webTask(void *parameter) {
 
 // --- WEB ENDPOINTS ---
 
-// 1. /data Endpoint (Now highly verbose for debugging)
+// 1. /data Endpoint (Now neatly structured hierarchically)
 void handleData() {
   String json = "{";
   
   // System Metrics
+  json += "\"system\":{";
   json += "\"uptime\":" + String(millis()) + ",";
   json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
-  json += "\"wifiClients\":" + String(WiFi.softAPgetStationNum()) + ",";
+  json += "\"wifiClients\":" + String(WiFi.softAPgetStationNum());
+  json += "},";
 
   // Hardware Status
+  json += "\"hardware\":{";
   json += "\"limitUpper\":" + String(digitalRead(BUTTON_PIN_1) == LOW ? 1 : 0) + ",";
-  json += "\"limitLower\":" + String(digitalRead(BUTTON_PIN_2) == LOW ? 1 : 0) + ",";
+  json += "\"limitLower\":" + String(digitalRead(BUTTON_PIN_2) == LOW ? 1 : 0);
+  json += "},";
 
   // Current Mode
   SystemMode modeCopy;
@@ -109,7 +115,9 @@ void handleData() {
     modeCopy = currentMode;
     xSemaphoreGive(modeLock);
   }
-  json += "\"mode\":" + String(modeCopy) + ",";
+  json += "\"state\":{";
+  json += "\"mode\":" + String(modeCopy);
+  json += "},";
   
   // Configuration Settings
   uint32_t currWait = 0, currInterval = 0; float currDepth = 40.0; int currSpeed = 1000;
@@ -120,14 +128,18 @@ void handleData() {
     currSpeed = targetMotorSpeed;
     xSemaphoreGive(configLock);
   }
-  json += "\"cfgWait\":" + String(currWait) + ",";
-  json += "\"cfgInterval\":" + String(currInterval) + ",";
-  json += "\"cfgTargetDepth\":" + String(currDepth) + ",";
-  json += "\"cfgMotorSpeed\":" + String(currSpeed) + ",";
+  json += "\"config\":{";
+  json += "\"waitMs\":" + String(currWait) + ",";
+  json += "\"intervalMs\":" + String(currInterval) + ",";
+  json += "\"targetDepthCm\":" + String(currDepth) + ",";
+  json += "\"motorSpeedUs\":" + String(currSpeed);
+  json += "},";
 
-  // Data & History
+  // Sensor Data & History
   if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
-    json += "\"currentDepth\":" + String(currentRelativeDepth * 100.0) + ",";
+    json += "\"sensor\":{";
+    json += "\"currentDepthCm\":" + String(currentRelativeDepth * 100.0) + ",";
+    json += "\"currentPressureMbar\":" + String(currentPressureMbar) + ",";
     json += "\"sensorIdx\":" + String(sensorIdx) + ",";
     json += "\"iterationCount\":" + String(iterationCount) + ",";
     json += "\"history\":[";
@@ -140,14 +152,14 @@ void handleData() {
       json += String(depthHistory[idx]);
       first = false;
     }
-    json += "]";
+    json += "]}"; // Close sensor & history array
     xSemaphoreGive(dataLock);
   }
-  json += "}";
+  json += "}"; // Close outer JSON
   server.send(200, "application/json", json);
 }
 
-// 2. /control Endpoint (Includes Graph & Extensive Live Debug Console)
+// 2. /control Endpoint (Includes Graph, Outlier Filter, and Debug Console)
 void handleControl() {
   if(server.hasArg("action")) {
     String action = server.arg("action");
@@ -177,28 +189,46 @@ void handleControl() {
   html += ".active { background-color: #ff4c4c; box-shadow: 0 0 8px #ff4c4c;} ";
   html += "canvas { background: #f4f4f4; border: 1px solid #ccc; border-radius: 8px; margin-top: 10px; max-width: 100%; } ";
   html += ".debug-panel { text-align:left; background:#222; color:#0f0; font-family:monospace; padding:10px; border-radius:5px; margin:10px auto; max-width:400px; font-size:12px; line-height:1.5; }";
+  html += ".appendix { color: #d9534f; font-weight: bold; font-size: 14px; margin-top: 5px; }";
   html += "</style>";
   
   html += "<script>";
   html += "function updateData() {";
   html += "  fetch('/data').then(r => r.json()).then(data => {";
-  html += "    document.getElementById('depthVal').innerText = data.currentDepth.toFixed(2) + ' cm';";
-  html += "    document.getElementById('indUpper').className = data.limitUpper ? 'indicator active' : 'indicator';";
-  html += "    document.getElementById('indLower').className = data.limitLower ? 'indicator active' : 'indicator';";
-  html += "    let modeStr = 'IDLE'; if(data.mode===1) modeStr = 'RUNNING SEQUENCE'; else if(data.mode===2) modeStr = 'HOLDING DEPTH';";
+  html += "    document.getElementById('depthVal').innerText = data.sensor.currentDepthCm.toFixed(2) + ' cm';";
+  html += "    document.getElementById('pressureVal').innerText = data.sensor.currentPressureMbar.toFixed(1) + ' mbar';";
+  html += "    document.getElementById('indUpper').className = data.hardware.limitUpper ? 'indicator active' : 'indicator';";
+  html += "    document.getElementById('indLower').className = data.hardware.limitLower ? 'indicator active' : 'indicator';";
+  html += "    let modeStr = 'IDLE'; if(data.state.mode===1) modeStr = 'RUNNING SEQUENCE'; else if(data.state.mode===2) modeStr = 'HOLDING DEPTH';";
   html += "    document.getElementById('modeVal').innerText = modeStr;";
   
-  // Update Debug Panel
-  html += "    document.getElementById('dbgUptime').innerText = (data.uptime/1000).toFixed(1) + ' s';";
-  html += "    document.getElementById('dbgHeap').innerText = data.freeHeap + ' bytes';";
-  html += "    document.getElementById('dbgClients').innerText = data.wifiClients;";
-  html += "    document.getElementById('dbgIter').innerText = data.iterationCount;";
-  html += "    document.getElementById('dbgIdx').innerText = data.sensorIdx;";
-  html += "    document.getElementById('dbgWait').innerText = data.cfgWait + ' ms';";
-  html += "    document.getElementById('dbgInterval').innerText = data.cfgInterval + ' ms';";
-  html += "    document.getElementById('dbgSpeed').innerText = data.cfgMotorSpeed + ' us';";
+  // Update Debug Panel (Using nested paths)
+  html += "    document.getElementById('dbgUptime').innerText = (data.system.uptime/1000).toFixed(1) + ' s';";
+  html += "    document.getElementById('dbgHeap').innerText = data.system.freeHeap + ' bytes';";
+  html += "    document.getElementById('dbgClients').innerText = data.system.wifiClients;";
+  html += "    document.getElementById('dbgIter').innerText = data.sensor.iterationCount;";
+  html += "    document.getElementById('dbgIdx').innerText = data.sensor.sensorIdx;";
+  html += "    document.getElementById('dbgWait').innerText = data.config.waitMs + ' ms';";
+  html += "    document.getElementById('dbgInterval').innerText = data.config.intervalMs + ' ms';";
+  html += "    document.getElementById('dbgSpeed').innerText = data.config.motorSpeedUs + ' us';";
 
-  html += "    drawChart(data.history);";
+  // Filter 2+ meter anomalies out
+  html += "    let raw = data.sensor.history;";
+  html += "    let clean = [];";
+  html += "    let anomalies = 0;";
+  html += "    if(raw.length > 0) {";
+  html += "      clean.push(raw[0]);";
+  html += "      for(let i=1; i<raw.length; i++) {";
+  html += "        if(Math.abs(raw[i] - clean[clean.length-1]) > 200) {"; // > 200cm (2m) change
+  html += "          anomalies++;";
+  html += "        } else {";
+  html += "          clean.push(raw[i]);";
+  html += "        }";
+  html += "      }";
+  html += "    }";
+  
+  html += "    document.getElementById('appendixMsg').innerText = anomalies > 0 ? '* Appendix: ' + anomalies + ' extreme data point(s) (>2m sudden height change) automatically filtered from graph.' : '';";
+  html += "    drawChart(clean);";
   html += "  });";
   html += "}";
   html += "setInterval(updateData, 500);"; 
@@ -225,12 +255,14 @@ void handleControl() {
   
   html += "<h2>MATE ROV Controller</h2>";
   html += "<p>Status: <strong id='modeVal'>LOADING...</strong></p>";
-  html += "<h1 id='depthVal'>-- cm</h1>";
+  html += "<h1 id='depthVal' style='margin-bottom:0;'>-- cm</h1>";
+  html += "<p style='margin-top:5px; color:#555;'>Pressure: <span id='pressureVal'>-- mbar</span></p>";
   
   html += "<div><span id='indUpper' class='indicator'></span> Upper Limit (Sinking Stop)</div><br>";
   html += "<div><span id='indLower' class='indicator'></span> Lower Limit (Floating Stop)</div><br>";
   
   html += "<canvas id='chart' width='400' height='200'></canvas><br>";
+  html += "<div id='appendixMsg' class='appendix'></div>"; // Placeholder for extreme data remark
 
   // --- NEW DEBUG PANEL ---
   html += "<div class='debug-panel'>";
