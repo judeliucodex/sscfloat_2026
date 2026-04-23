@@ -1,0 +1,317 @@
+#include <Wire.h>
+#include <MS5837.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <ArduinoOTA.h>
+#include <Update.h>
+
+// --- I2C PINS ---
+#define CUSTOM_SDA_PIN 21
+#define CUSTOM_SCL_PIN 22
+
+MS5837 sensor;
+
+// --- WIFI CREDENTIALS ---
+const char* ssid     = "SSCFloat";
+const char* password = "DT1234dt";
+WebServer server(80);
+
+// --- SENSOR VARIABLES ---
+char dataPackets[120][32]; // Stores exactly 120 pre-formatted packets (max 32 characters each)
+int sensorIdx = 0;
+int iterationCount = 0;
+float currentRelativeDepth = 0.0; 
+float surfaceDepthOffset = 0.0;   
+
+// --- MOTOR PINS & SETTINGS ---
+const int dirPin  = 4;
+const int stepPin = 16;
+int motorSpeed = 2000;
+
+// --- LIMIT SWITCHES ---
+#define BUTTON_PIN_1 19    // Upper Limit (Sinking stop)
+#define BUTTON_PIN_2 18    // Lower Limit (Floating stop)
+
+// --- STATE MACHINE ---
+enum SystemMode {
+  MODE_IDLE,
+  MODE_SEQUENCE
+};
+volatile SystemMode currentMode = MODE_IDLE; 
+
+// --- CONFIGURATION VARIABLES ---
+uint32_t floatWaitTimeMs = 45000;      // Default: 45 seconds at the bottom
+uint32_t sensorReadIntervalMs = 1000;  // Default: 1000ms (1Hz) sensor reading
+
+// --- MUTEXES & TASK HANDLES ---
+SemaphoreHandle_t dataLock = NULL;
+SemaphoreHandle_t modeLock = NULL;
+SemaphoreHandle_t configLock = NULL;
+
+TaskHandle_t sensorTaskHandle = NULL;
+TaskHandle_t webTaskHandle = NULL;
+TaskHandle_t motorTaskHandle = NULL;
+
+// --- SENSOR TASK ---
+void sensorTask(void *parameter) {
+  while(1) {
+    sensor.read();
+    
+    if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+      currentRelativeDepth = sensor.depth() - surfaceDepthOffset; 
+      
+      // Calculate specific values based on rules
+      unsigned long floatTimeSec = millis() / 1000; // Integer time since boot
+      float pressureKpa = sensor.pressure() / 10.0; // Sensor outputs mbar. 10 mbar = 1 kPa
+
+      // Format packet directly into the circular buffer
+      // %lu = unsigned long, %.1f = 1 decimal float, %.2f = 2 decimal float
+      snprintf(dataPackets[sensorIdx], 32, "RN10 %lus %.1fkpa %.2fm", 
+               floatTimeSec, 
+               pressureKpa, 
+               currentRelativeDepth);
+
+      sensorIdx = (sensorIdx + 1) % 120;
+      iterationCount++;
+      xSemaphoreGive(dataLock);
+    }
+    
+    uint32_t delayMs = 1000; 
+    if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+      delayMs = sensorReadIntervalMs;
+      xSemaphoreGive(configLock);
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(delayMs)); 
+  }
+}
+
+// --- WEB SERVER TASK ---
+void webTask(void *parameter) {
+  while(1) {
+    server.handleClient();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// --- WEB ENDPOINTS ---
+
+void handleData() {
+  if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+    int count = iterationCount < 120 ? iterationCount : 120;
+    String data = "Current Depth: " + String(currentRelativeDepth * 100.0) + " cm\n\n";
+    
+    // Loop backwards: i = 0 is the newest reading, progressing to older readings
+    for (int i = 0; i < count; i++) {
+      int idx = (sensorIdx - 1 - i + 120) % 120;
+      data += String(dataPackets[idx]) + "\n";
+    }
+    xSemaphoreGive(dataLock);
+    server.send(200, "text/plain", data);
+  }
+}
+
+void handleControl() {
+  if(server.hasArg("action")) {
+    String action = server.arg("action");
+    
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      if (action == "start") currentMode = MODE_SEQUENCE;
+      else if (action == "stop") currentMode = MODE_IDLE;
+      xSemaphoreGive(modeLock);
+    }
+    
+    server.sendHeader("Location", "/control");
+    server.send(303);
+    return;
+  } 
+
+  SystemMode modeCopy;
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    modeCopy = currentMode;
+    xSemaphoreGive(modeLock);
+  }
+
+  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>button { padding: 15px; margin: 10px; font-size: 18px; width: 90%; max-width: 400px; display: block; } ";
+  html += ".stop { background-color: #ff4c4c; color: white; font-weight: bold; } ";
+  html += ".config { background-color: #4CAF50; color: white; }</style></head><body>";
+  html += "<h2>MATE ROV Float Controller</h2>";
+  
+  if (modeCopy == MODE_IDLE) html += "<p>Status: <strong>IDLE</strong></p>";
+  else if (modeCopy == MODE_SEQUENCE) html += "<p>Status: <strong>RUNNING SEQUENCE</strong></p>";
+
+  html += "<button onclick=\"location.href='/control?action=start'\">Run Full Sequence (Bottom & Return)</button>";
+  html += "<button class='stop' onclick=\"location.href='/control?action=stop'\">EMERGENCY STOP</button>";
+  html += "<hr><button class='config' onclick=\"location.href='/config'\">Settings & Configuration</button>";
+  
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleConfig() {
+  if (server.method() == HTTP_POST || server.args() > 0) {
+    if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+      if (server.hasArg("waitTime") && server.arg("waitTime") != "") {
+        floatWaitTimeMs = server.arg("waitTime").toInt();
+      }
+      if (server.hasArg("sensorInterval") && server.arg("sensorInterval") != "") {
+        sensorReadIntervalMs = server.arg("sensorInterval").toInt();
+      }
+      xSemaphoreGive(configLock);
+    }
+    server.sendHeader("Location", "/config");
+    server.send(303);
+    return;
+  }
+
+  uint32_t currWait = 0, currInterval = 0;
+  if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+    currWait = floatWaitTimeMs;
+    currInterval = sensorReadIntervalMs;
+    xSemaphoreGive(configLock);
+  }
+
+  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial;} input, button{padding:10px; margin:5px 0; font-size:16px; width:90%; max-width:400px;}</style></head><body>";
+  html += "<h2>Float Configuration</h2>";
+  
+  html += "<form action='/config' method='POST'>";
+  
+  html += "<label>Wait Time at Bottom (ms):<br><strong>Current = " + String(currWait) + " ms</strong></label><br>";
+  html += "<input type='number' name='waitTime' placeholder='Leave blank to keep current'><br><br>";
+  
+  html += "<label>Sensor Read Interval (ms):<br><strong>Current = " + String(currInterval) + " ms</strong></label><br>";
+  html += "<input type='number' name='sensorInterval' placeholder='Leave blank to keep current'><br><br>";
+  
+  html += "<button type='submit'>Save Changes</button>";
+  html += "</form>";
+  
+  html += "<br><button onclick=\"location.href='/control'\">Back to Control</button>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void stepMotorChunk(int steps, SystemMode expectedMode) {
+  for (int i = 0; i < steps; i++) {
+    if (currentMode != expectedMode) return; 
+    
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(motorSpeed);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(motorSpeed);
+    
+    if (i % 20 == 0) taskYIELD(); 
+  }
+}
+
+void runStepperSequence() {
+  // SINK
+  digitalWrite(dirPin, LOW);
+  while(digitalRead(BUTTON_PIN_1) == HIGH && currentMode == MODE_SEQUENCE) {  
+      stepMotorChunk(20, MODE_SEQUENCE);
+  }
+  
+  if (currentMode != MODE_SEQUENCE) return; 
+  
+  // WAIT AT BOTTOM
+  uint32_t waitTime = 45000; 
+  if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+    waitTime = floatWaitTimeMs;
+    xSemaphoreGive(configLock);
+  }
+  
+  uint32_t startTime = millis();
+  while ((millis() - startTime) < waitTime) {
+    if (currentMode != MODE_SEQUENCE) return; 
+    vTaskDelay(pdMS_TO_TICKS(100)); 
+  }
+  
+  if (currentMode != MODE_SEQUENCE) return; 
+  
+  // FLOAT (Surface)
+  digitalWrite(dirPin, HIGH);
+  while(digitalRead(BUTTON_PIN_2) == HIGH && currentMode == MODE_SEQUENCE) {  
+      stepMotorChunk(20, MODE_SEQUENCE);
+  }
+  
+  // Done with sequence, return to IDLE
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    if (currentMode == MODE_SEQUENCE) currentMode = MODE_IDLE;
+    xSemaphoreGive(modeLock);
+  }
+}
+
+void motorTask(void *parameter) {
+  while(1) {
+    SystemMode currentModeCopy;
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      currentModeCopy = currentMode;
+      xSemaphoreGive(modeLock);
+    }
+    
+    if (currentModeCopy == MODE_SEQUENCE) {
+      runStepperSequence();
+    } 
+    else {
+      vTaskDelay(pdMS_TO_TICKS(100)); 
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200); 
+  delay(1000);
+  
+  Wire.begin(CUSTOM_SDA_PIN, CUSTOM_SCL_PIN);
+  
+  if (!sensor.init()) {
+    Serial.println("Sensor failed to initialize.");
+    while (1);
+  }
+  sensor.setFluidDensity(997); 
+  
+  sensor.read();
+  surfaceDepthOffset = sensor.depth(); 
+  
+  pinMode(dirPin, OUTPUT);
+  pinMode(stepPin, OUTPUT);
+  pinMode(BUTTON_PIN_1, INPUT_PULLUP);
+  pinMode(BUTTON_PIN_2, INPUT_PULLUP); 
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+  WiFi.setSleep(false);
+  
+  ArduinoOTA.begin();
+  
+  server.on("/data", handleData);
+  server.on("/control", handleControl);
+  server.on("/config", handleConfig);
+  server.begin();
+  
+  dataLock = xSemaphoreCreateMutex();
+  modeLock = xSemaphoreCreateMutex();
+  configLock = xSemaphoreCreateMutex();
+  
+  xTaskCreatePinnedToCore(sensorTask, "SensorTask", 4096, NULL, 2, &sensorTaskHandle, 0);
+  xTaskCreatePinnedToCore(webTask, "WebTask", 4096, NULL, 1, &webTaskHandle, 0);
+  xTaskCreatePinnedToCore(motorTask, "MotorTask", 4096, NULL, 3, &motorTaskHandle, 1);
+}
+
+void loop() {
+  ArduinoOTA.handle(); 
+  
+  static int lastStationNum = -1;
+  int currentStations = WiFi.softAPgetStationNum();
+  if (currentStations != lastStationNum) {
+    Serial.printf("Connected clients to SSCFloat: %d\n", currentStations);
+    lastStationNum = currentStations;
+  }
+  
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
