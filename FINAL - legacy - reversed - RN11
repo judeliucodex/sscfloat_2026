@@ -63,7 +63,7 @@ void sensorTask(void *parameter) {
       sensor.read();
       
       if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
-        currentRelativeDepth = sensor.depth() - surfaceDepthOffset; 
+        currentRelativeDepth = -(sensor.depth() - surfaceDepthOffset);
         unsigned long floatTimeSec = millis() / 1000; 
         float pressureKpa = sensor.pressure() / 10.0; 
 
