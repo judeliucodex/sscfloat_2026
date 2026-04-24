@@ -247,7 +247,7 @@ void stepMotorChunk(int steps, SystemMode expectedMode) {
 }
 
 void runStepperSequence() {
-  digitalWrite(dirPin, LOW);
+  digitalWrite(dirPin, HIGH);
   while(digitalRead(BUTTON_PIN_1) == HIGH && currentMode == MODE_SEQUENCE) stepMotorChunk(20, MODE_SEQUENCE);
   if (currentMode != MODE_SEQUENCE) return; 
   
@@ -264,7 +264,7 @@ void runStepperSequence() {
   }
   
   if (currentMode != MODE_SEQUENCE) return; 
-  digitalWrite(dirPin, HIGH);
+  digitalWrite(dirPin, LOW);
   while(digitalRead(BUTTON_PIN_2) == HIGH && currentMode == MODE_SEQUENCE) stepMotorChunk(20, MODE_SEQUENCE);
   
   if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
